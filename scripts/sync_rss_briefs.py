@@ -10,29 +10,24 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
-DEFAULT_FEEDS = [
-    ("ShieldX Defense", "https://shieldxdefense.com/feed.json"),
-    ("ShieldX Defense", "https://shieldxdefense.com/rss.xml"),
-    ("Atomic Oversight", "https://atomicoversight.org/rss.xml"),
-    ("Atomic Oversight", "https://atomicoversight.org/feed.json"),
+SITEMAP_SOURCES = [
+    ("ShieldX Defense", "https://shieldxdefense.com", ["/intel/"]),
+    ("Atomic Oversight", "https://atomicoversight.org", ["/intel/", "/reports/", "/briefings/", "/plume"]),
+    ("WakeUp Nuclear", "https://wakeupnuclear.org", ["/reports/", "/benchmarks/"]),
+    ("WakeUp Ballistic", "https://wakeupbulletproof.com", ["/briefings/"]),
+]
+
+SITEMAP_CANDIDATES = [
+    "/sitemap-index.xml",
+    "/sitemap-0.xml",
+    "/sitemap.xml",
 ]
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BRIEFINGS_DIR = ROOT / "briefings"
 README_PATH = ROOT / "README.md"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-
-def load_feeds():
-    feeds = list(DEFAULT_FEEDS)
-    extra = os.environ.get("EXTRA_RSS_FEEDS", "").strip()
-    if extra:
-        for idx, raw_url in enumerate(re.split(r"[\s,]+", extra), start=1):
-            url = raw_url.strip()
-            if url.startswith("http"):
-                label = "Substack Dispatch" if "substack.com" in url else f"External Feed {idx}"
-                feeds.append((label, url))
-    return feeds
+MAX_NEW_PER_RUN = 30
 
 
 def fetch_bytes(url):
@@ -46,33 +41,27 @@ def fetch_bytes(url):
                 "-H",
                 f"User-Agent: {USER_AGENT}",
                 "-H",
-                "Accept: application/feed+json, application/rss+xml, application/xml, text/xml, */*",
+                "Accept: text/html,application/xhtml+xml,application/xml,application/rss+xml,application/feed+json;q=0.9,*/*;q=0.8",
                 url,
             ],
             capture_output=True,
             check=False,
         )
         if res.returncode == 0 and res.stdout:
-            print(f"[OK] curl fetched {url} ({len(res.stdout)} bytes)")
             return res.stdout
     except FileNotFoundError:
         pass
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/feed+json, application/rss+xml, application/xml, text/xml, */*",
-        },
-    )
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            data = resp.read()
-            print(f"[OK] urllib fetched {url} ({len(data)} bytes)")
-            return data
-    except (urllib.error.URLError, TimeoutError) as exc:
-        print(f"[SKIP] {url}: {exc}")
+            return resp.read()
+    except (urllib.error.URLError, TimeoutError):
         return None
+
+
+def local_tag(tag):
+    return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
 def strip_html(raw_text):
@@ -102,89 +91,154 @@ def parse_date(raw_date):
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
-def parse_json_feed(source_name, raw_bytes):
-    items = []
-    try:
-        payload = json.loads(raw_bytes.decode("utf-8"))
-    except Exception:
-        return items
-
-    for item in payload.get("items", []):
-        title = (item.get("title") or "").strip()
-        link = (item.get("url") or item.get("id") or "").strip()
-        summary = strip_html(
-            item.get("summary")
-            or item.get("content_text")
-            or item.get("content_html")
-            or ""
-        )
-        pub_date = parse_date(item.get("date_published") or item.get("date_modified") or "")
-        if title and link.startswith("http"):
-            items.append({
-                "source": source_name,
-                "title": html.unescape(title),
-                "link": link,
-                "summary": summary,
-                "date": pub_date,
-            })
-    return items
-
-
-def parse_xml_feed(source_name, xml_bytes):
-    items = []
+def parse_sitemap_xml(xml_bytes):
+    child_sitemaps = []
+    urls = []
     try:
         root = ET.fromstring(xml_bytes)
-    except ET.ParseError as exc:
-        print(f"[SKIP] XML parse error for {source_name}: {exc}")
-        return items
+    except ET.ParseError:
+        return child_sitemaps, urls
 
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        desc = strip_html(item.findtext("description") or "")
-        pub_date = parse_date(item.findtext("pubDate") or "")
-        if title and link.startswith("http"):
-            items.append({
-                "source": source_name,
-                "title": html.unescape(title),
-                "link": link,
-                "summary": desc,
-                "date": pub_date,
-            })
-
-    if not items:
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for entry in root.findall(".//atom:entry", ns):
-            title = (entry.findtext("atom:title", namespaces=ns) or "").strip()
-            link_el = entry.find("atom:link", ns)
-            link = (link_el.attrib.get("href", "") if link_el is not None else "").strip()
-            summary = strip_html(
-                entry.findtext("atom:summary", namespaces=ns)
-                or entry.findtext("atom:content", namespaces=ns)
-                or ""
-            )
-            pub_date = parse_date(
-                entry.findtext("atom:published", namespaces=ns)
-                or entry.findtext("atom:updated", namespaces=ns)
-                or ""
-            )
-            if title and link.startswith("http"):
-                items.append({
-                    "source": source_name,
-                    "title": html.unescape(title),
-                    "link": link,
-                    "summary": summary,
-                    "date": pub_date,
-                })
-
-    return items
+    root_name = local_tag(root.tag)
+    if root_name == "sitemapindex":
+        for child in root:
+            if local_tag(child.tag) == "sitemap":
+                for sub in child:
+                    if local_tag(sub.tag) == "loc" and sub.text:
+                        child_sitemaps.append(sub.text.strip())
+    elif root_name == "urlset":
+        for child in root:
+            if local_tag(child.tag) == "url":
+                loc = ""
+                lastmod = ""
+                for sub in child:
+                    name = local_tag(sub.tag)
+                    if name == "loc" and sub.text:
+                        loc = sub.text.strip()
+                    elif name == "lastmod" and sub.text:
+                        lastmod = sub.text.strip()
+                if loc:
+                    urls.append((loc, lastmod))
+    return child_sitemaps, urls
 
 
-def parse_feed(source_name, raw_bytes):
-    stripped = raw_bytes.lstrip()
-    if stripped.startswith(b"{"):
-        return parse_json_feed(source_name, raw_bytes)
-    return parse_xml_feed(source_name, raw_bytes)
+def discover_sitemap_urls(base_url, prefixes):
+    found = []
+    visited_sitemaps = set()
+    queue = [base_url.rstrip("/") + path for path in SITEMAP_CANDIDATES]
+
+    while queue:
+        sm_url = queue.pop(0)
+        if sm_url in visited_sitemaps:
+            continue
+        visited_sitemaps.add(sm_url)
+        raw = fetch_bytes(sm_url)
+        if not raw:
+            continue
+        children, urls = parse_sitemap_xml(raw)
+        if children:
+            for c in children:
+                if c not in visited_sitemaps:
+                    queue.append(c)
+        if urls:
+            for loc, lastmod in urls:
+                if any(p in loc for p in prefixes):
+                    found.append((loc, lastmod))
+            break
+
+    deduped = {}
+    for loc, lastmod in found:
+        norm = loc.rstrip("/")
+        if norm not in deduped:
+            deduped[norm] = (loc, lastmod)
+    return list(deduped.values())
+
+
+def extract_html_metadata(raw_bytes, fallback_url):
+    text = raw_bytes.decode("utf-8", errors="ignore")
+    title = ""
+    desc = ""
+    pub_date = ""
+
+    og_title = re.search(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        text,
+        re.IGNORECASE,
+    )
+    if og_title:
+        title = html.unescape(og_title.group(1)).strip()
+    if not title:
+        t_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+        if t_match:
+            title = strip_html(t_match.group(1))
+    if not title:
+        title = fallback_url.rstrip("/").split("/")[-1].replace("-", " ").title()
+
+    for pat in (
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            desc = html.unescape(m.group(1)).strip()
+            break
+
+    d_match = re.search(
+        r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
+        text,
+        re.IGNORECASE,
+    )
+    if d_match:
+        pub_date = d_match.group(1).strip()
+
+    return title, desc, pub_date
+
+
+def parse_extra_rss_feeds():
+    extra = os.environ.get("EXTRA_RSS_FEEDS", "").strip()
+    if not extra:
+        return []
+    entries = []
+    for idx, raw_url in enumerate(re.split(r"[\s,]+", extra), start=1):
+        url = raw_url.strip()
+        if not url.startswith("http"):
+            continue
+        raw = fetch_bytes(url)
+        if not raw:
+            print(f"[SKIP] Extra feed unreachable: {url}")
+            continue
+        source_name = "Substack Dispatch" if "substack.com" in url else f"External Feed {idx}"
+        try:
+            root = ET.fromstring(raw)
+            for item in root.findall(".//item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                desc = strip_html(item.findtext("description") or "")
+                pub_date = parse_date(item.findtext("pubDate") or "")
+                if title and link.startswith("http"):
+                    entries.append({
+                        "source": source_name,
+                        "title": html.unescape(title),
+                        "link": link,
+                        "summary": desc,
+                        "date": pub_date,
+                    })
+        except ET.ParseError:
+            print(f"[SKIP] Invalid XML in extra feed: {url}")
+    return entries
+
+
+def load_existing_urls():
+    existing = set()
+    if not BRIEFINGS_DIR.exists():
+        return existing
+    for path in BRIEFINGS_DIR.glob("*.md"):
+        text = path.read_text(encoding="utf-8")
+        m = re.search(r"^\-\s+\*\*Canonical URL:\*\*\s+(.+)$", text, re.MULTILINE)
+        if m:
+            existing.add(m.group(1).strip().rstrip("/"))
+    return existing
 
 
 def write_briefing(entry):
@@ -229,7 +283,7 @@ def collect_index_rows():
                 "file": f"briefings/{path.name}",
                 "url": url_m.group(1).strip(),
             })
-    return rows[:25]
+    return rows[:30]
 
 
 def update_readme(rows):
@@ -253,28 +307,50 @@ def update_readme(rows):
         ]
         body = "\n".join(table_lines) + "\n"
     else:
-        body = "| Pending | System | Awaiting first scheduled RSS sync | — |\n"
+        body = "| Pending | System | Awaiting first scheduled sync | — |\n"
 
     README_PATH.write_text(header + body, encoding="utf-8")
 
 
 def main():
     BRIEFINGS_DIR.mkdir(parents=True, exist_ok=True)
-    seen_urls = set()
+    existing_urls = load_existing_urls()
     created = 0
-    for source_name, url in load_feeds():
-        raw_bytes = fetch_bytes(url)
-        if not raw_bytes:
-            continue
-        entries = parse_feed(source_name, raw_bytes)
-        print(f"[INFO] {source_name} ({url}) -> {len(entries)} entries")
-        for entry in entries:
-            if entry["link"] in seen_urls:
+
+    for source_name, base_url, prefixes in SITEMAP_SOURCES:
+        discovered = discover_sitemap_urls(base_url, prefixes)
+        print(f"[INFO] {source_name} sitemap matched {len(discovered)} target URLs")
+        for loc, lastmod in discovered:
+            if created >= MAX_NEW_PER_RUN:
+                break
+            norm = loc.rstrip("/")
+            if norm in existing_urls:
                 continue
-            seen_urls.add(entry["link"])
-            _, is_new = write_briefing(entry)
+            page_bytes = fetch_bytes(loc)
+            if not page_bytes:
+                continue
+            title, desc, html_date = extract_html_metadata(page_bytes, loc)
+            pub_date = parse_date(html_date or lastmod)
+            _, is_new = write_briefing({
+                "source": source_name,
+                "title": title,
+                "link": loc,
+                "summary": desc,
+                "date": pub_date,
+            })
             if is_new:
+                existing_urls.add(norm)
                 created += 1
+
+    for entry in parse_extra_rss_feeds():
+        norm = entry["link"].rstrip("/")
+        if norm in existing_urls:
+            continue
+        _, is_new = write_briefing(entry)
+        if is_new:
+            existing_urls.add(norm)
+            created += 1
+
     rows = collect_index_rows()
     update_readme(rows)
     print(f"Sync complete. New briefings written: {created}. Total indexed: {len(rows)}.")
