@@ -5,19 +5,22 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
 DEFAULT_FEEDS = [
+    ("ShieldX Defense", "https://shieldxdefense.com/feed.json"),
     ("ShieldX Defense", "https://shieldxdefense.com/rss.xml"),
     ("Atomic Oversight", "https://atomicoversight.org/rss.xml"),
+    ("Atomic Oversight", "https://atomicoversight.org/feed.json"),
 ]
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BRIEFINGS_DIR = ROOT / "briefings"
 README_PATH = ROOT / "README.md"
-USER_AGENT = "D9-OSINT-Archiver/1.0 (+https://github.com/d9-osint-group)"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
 def load_feeds():
@@ -32,13 +35,43 @@ def load_feeds():
     return feeds
 
 
-def fetch_xml(url):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def fetch_bytes(url):
+    try:
+        res = subprocess.run(
+            [
+                "curl",
+                "-fsSL",
+                "--max-time",
+                "20",
+                "-H",
+                f"User-Agent: {USER_AGENT}",
+                "-H",
+                "Accept: application/feed+json, application/rss+xml, application/xml, text/xml, */*",
+                url,
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout:
+            print(f"[OK] curl fetched {url} ({len(res.stdout)} bytes)")
+            return res.stdout
+    except FileNotFoundError:
+        pass
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/feed+json, application/rss+xml, application/xml, text/xml, */*",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            return resp.read()
+            data = resp.read()
+            print(f"[OK] urllib fetched {url} ({len(data)} bytes)")
+            return data
     except (urllib.error.URLError, TimeoutError) as exc:
-        print(f"Skip {url}: {exc}")
+        print(f"[SKIP] {url}: {exc}")
         return None
 
 
@@ -69,12 +102,40 @@ def parse_date(raw_date):
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
-def parse_feed(source_name, xml_bytes):
+def parse_json_feed(source_name, raw_bytes):
+    items = []
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except Exception:
+        return items
+
+    for item in payload.get("items", []):
+        title = (item.get("title") or "").strip()
+        link = (item.get("url") or item.get("id") or "").strip()
+        summary = strip_html(
+            item.get("summary")
+            or item.get("content_text")
+            or item.get("content_html")
+            or ""
+        )
+        pub_date = parse_date(item.get("date_published") or item.get("date_modified") or "")
+        if title and link.startswith("http"):
+            items.append({
+                "source": source_name,
+                "title": html.unescape(title),
+                "link": link,
+                "summary": summary,
+                "date": pub_date,
+            })
+    return items
+
+
+def parse_xml_feed(source_name, xml_bytes):
     items = []
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
-        print(f"XML parse error for {source_name}: {exc}")
+        print(f"[SKIP] XML parse error for {source_name}: {exc}")
         return items
 
     for item in root.findall(".//item"):
@@ -82,7 +143,7 @@ def parse_feed(source_name, xml_bytes):
         link = (item.findtext("link") or "").strip()
         desc = strip_html(item.findtext("description") or "")
         pub_date = parse_date(item.findtext("pubDate") or "")
-        if title and link:
+        if title and link.startswith("http"):
             items.append({
                 "source": source_name,
                 "title": html.unescape(title),
@@ -107,7 +168,7 @@ def parse_feed(source_name, xml_bytes):
                 or entry.findtext("atom:updated", namespaces=ns)
                 or ""
             )
-            if title and link:
+            if title and link.startswith("http"):
                 items.append({
                     "source": source_name,
                     "title": html.unescape(title),
@@ -117,6 +178,13 @@ def parse_feed(source_name, xml_bytes):
                 })
 
     return items
+
+
+def parse_feed(source_name, raw_bytes):
+    stripped = raw_bytes.lstrip()
+    if stripped.startswith(b"{"):
+        return parse_json_feed(source_name, raw_bytes)
+    return parse_xml_feed(source_name, raw_bytes)
 
 
 def write_briefing(entry):
@@ -191,12 +259,19 @@ def update_readme(rows):
 
 
 def main():
+    BRIEFINGS_DIR.mkdir(parents=True, exist_ok=True)
+    seen_urls = set()
     created = 0
     for source_name, url in load_feeds():
-        xml_bytes = fetch_xml(url)
-        if not xml_bytes:
+        raw_bytes = fetch_bytes(url)
+        if not raw_bytes:
             continue
-        for entry in parse_feed(source_name, xml_bytes):
+        entries = parse_feed(source_name, raw_bytes)
+        print(f"[INFO] {source_name} ({url}) -> {len(entries)} entries")
+        for entry in entries:
+            if entry["link"] in seen_urls:
+                continue
+            seen_urls.add(entry["link"])
             _, is_new = write_briefing(entry)
             if is_new:
                 created += 1
